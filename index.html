@@ -75,6 +75,11 @@
   .profile-menu button{width:100%;text-align:left;background:none;color:var(--ink);border-radius:0;padding:11px 14px;font-weight:500;}
   .profile-menu button:hover{background:var(--bg);opacity:1;}
 
+  /* ---- xodim rasmi ustidagi menyu (Rasmni ko'rish / Profilga kirish) ---- */
+  .student-avatar-menu{padding-top:8px;}
+  .avatar-menu-item{display:block;width:100%;text-align:left;background:none;color:var(--ink);border-radius:0;padding:10px 14px;font-weight:500;}
+  .avatar-menu-item:hover{background:var(--brand-soft);color:var(--brand);opacity:1;}
+
   /* ---- layout ---- */
   main{flex:1;padding:22px;max-width:960px;margin:0 auto;width:100%;}
   .tabs{display:flex;gap:6px;margin-bottom:18px;flex-wrap:wrap;}
@@ -201,6 +206,13 @@ const api = {
     return [{}];
   },
 
+  /* Admin (yoki co-admin) boshqa xodimning rasmini uning o'rniga o'zgartirishi uchun */
+  async app_admin_set_avatar({p_admin_id, p_student_id, p_avatar}){
+    await requireAdminLike(p_admin_id);
+    await db.collection("users").doc(p_student_id).update({ avatar: p_avatar });
+    return [{}];
+  },
+
   async app_create_student({p_admin_id, p_username, p_password, p_full_name, p_is_co_admin}){
     await requireAdminLike(p_admin_id);
     const dup = await db.collection("users").where("username","==",p_username).limit(1).get();
@@ -216,7 +228,7 @@ const api = {
   async app_list_students({p_admin_id}){
     await requireAdminLike(p_admin_id);
     const snap = await db.collection("users").where("role","==","student").get();
-    const rows = snap.docs.map(d=>{ const v=d.data(); return { id:d.id, username:v.username, full_name:v.full_name, created_at: tsToIso(v.createdAt), is_co_admin: v.isCoAdmin === true, can_resubmit: v.canResubmit === true }; });
+    const rows = snap.docs.map(d=>{ const v=d.data(); return { id:d.id, username:v.username, full_name:v.full_name, avatar: v.avatar || null, created_at: tsToIso(v.createdAt), is_co_admin: v.isCoAdmin === true, can_resubmit: v.canResubmit === true }; });
     rows.sort((a,b)=> (b.created_at||"").localeCompare(a.created_at||""));
     return rows;
   },
@@ -262,6 +274,22 @@ const api = {
     if(!p_new_password) throw new Error("Yangi parolni kiriting");
     await db.collection("users").doc(p_user_id).update({ password: p_new_password });
     return [{}];
+  },
+
+  /* Admin xodimning login/parolini uning o'rniga, joriy parolni bilmasdan o'zgartirishi uchun */
+  async app_admin_update_student({p_admin_id, p_student_id, p_new_username, p_new_password}){
+    await requireAdminLike(p_admin_id);
+    const updates = {};
+    if(p_new_username){
+      const dup = await db.collection("users").where("username","==",p_new_username).limit(1).get();
+      if(!dup.empty && dup.docs[0].id !== p_student_id) throw new Error("duplicate: bu login band");
+      updates.username = p_new_username;
+    }
+    if(p_new_password) updates.password = p_new_password;
+    if(Object.keys(updates).length) await db.collection("users").doc(p_student_id).update(updates);
+    const fresh = await db.collection("users").doc(p_student_id).get();
+    const v = fresh.data();
+    return [{ id: p_student_id, username: v.username }];
   },
 
   async app_create_test({p_admin_id, p_title, p_questions, p_time_limit_minutes, p_kind}){
@@ -969,10 +997,21 @@ function fillManageStudents(box){
     const isFullAdmin = state.session.role === "admin";
     box.innerHTML = `
       <table>
-        <thead><tr><th>Ism</th><th>Login</th><th>Qo'shilgan sana</th><th>Qayta topshirish</th><th></th><th></th></tr></thead>
+        <thead><tr><th>Rasm</th><th>Ism</th><th>Login</th><th>Qo'shilgan sana</th><th>Qayta topshirish</th><th></th><th></th></tr></thead>
         <tbody>
           ${rows.map(r=>`
             <tr data-id="${r.id}">
+              <td>
+                <div class="student-avatar-wrap" data-id="${r.id}" style="position:relative;display:inline-block;">
+                  <div class="student-avatar" style="width:38px;height:38px;border-radius:50%;overflow:hidden;background:var(--brand-soft);display:flex;align-items:center;justify-content:center;font-weight:700;color:var(--brand);font-size:13px;cursor:pointer;flex:none;">
+                    ${r.avatar ? `<img src="${r.avatar}" style="width:100%;height:100%;object-fit:cover;" />` : escapeHtml(initials(r.full_name || r.username))}
+                  </div>
+                  <div class="student-avatar-menu" style="display:none;position:absolute;top:38px;left:0;background:#fff;border:1px solid var(--line);border-radius:10px;box-shadow:0 8px 24px rgba(20,25,40,.12);min-width:170px;overflow:hidden;z-index:20;">
+                    <button class="avatar-menu-item view-avatar-photo" type="button">Rasmni ko'rish</button>
+                    <button class="avatar-menu-item open-avatar-profile" type="button">Profilga kirish</button>
+                  </div>
+                </div>
+              </td>
               <td>${escapeHtml(r.full_name || "—")}${r.is_co_admin ? ` <span class="badge ok" style="margin-left:6px;">Admin</span>` : ""}</td>
               <td>${escapeHtml(r.username)}</td>
               <td>${new Date(r.created_at).toLocaleDateString("uz-UZ")}</td>
@@ -986,6 +1025,26 @@ function fillManageStudents(box){
         </tbody>
       </table>
     `;
+    box.querySelectorAll(".student-avatar-wrap").forEach(wrap=>{
+      const r = rows.find(x=>x.id === wrap.dataset.id);
+      const menu = wrap.querySelector(".student-avatar-menu");
+      let hideTimer = null;
+      const showMenu = ()=>{ if(hideTimer){ clearTimeout(hideTimer); hideTimer = null; } menu.style.display = "block"; };
+      const scheduleHide = ()=>{ if(hideTimer) clearTimeout(hideTimer); hideTimer = setTimeout(()=>{ menu.style.display = "none"; hideTimer = null; }, 250); };
+      wrap.addEventListener("mouseenter", showMenu);
+      wrap.addEventListener("mouseleave", scheduleHide);
+      menu.addEventListener("mouseenter", showMenu);
+      menu.addEventListener("mouseleave", scheduleHide);
+      wrap.querySelector(".view-avatar-photo").addEventListener("click", ()=>{
+        menu.style.display = "none";
+        if(r && r.avatar) showImageLightbox(r.avatar);
+        else showAlertModal("Bu xodim uchun hali rasm qo'yilmagan.");
+      });
+      wrap.querySelector(".open-avatar-profile").addEventListener("click", ()=>{
+        menu.style.display = "none";
+        if(r) showAdminStudentModal(r, box);
+      });
+    });
     box.querySelectorAll(".del-student").forEach(b=>{
       b.addEventListener("click", ()=>{
         showConfirmModal("Bu o'quvchini o'chirmoqchimisiz?", async ()=>{
@@ -1023,6 +1082,92 @@ function fillManageStudents(box){
   }).catch(e=>{
     box.innerHTML = `<div class="err">${escapeHtml(e.message||String(e))}</div>`;
   });
+}
+
+/* Admin (yoki co-admin) bitta xodimning rasmini, loginini va parolini
+   tahrirlaydigan oyna — avatarga ikki marta bosilganda ochiladi. */
+function showAdminStudentModal(student, refreshBox){
+  let currentAvatar = student.avatar || null;
+  const overlay = el(`
+    <div class="overlay">
+      <div class="modal">
+        <h2>${escapeHtml(student.full_name || student.username)} — profil</h2>
+        <div class="col">
+          <div class="row" style="align-items:center;gap:14px;margin-bottom:6px;">
+            <div id="asm-avatar-preview" style="width:64px;height:64px;border-radius:50%;overflow:hidden;background:var(--brand-soft);display:flex;align-items:center;justify-content:center;font-weight:700;color:var(--brand);font-size:20px;flex:none;">
+              ${currentAvatar ? `<img src="${currentAvatar}" style="width:100%;height:100%;object-fit:cover;" />` : escapeHtml(initials(student.full_name || student.username))}
+            </div>
+            <div>
+              <input type="file" id="asm-avatar-input" accept="image/*" style="display:none;" />
+              <button class="secondary" id="asm-avatar-btn" type="button">Rasm tanlash</button>
+            </div>
+          </div>
+          <div>
+            <label>Login</label>
+            <input type="text" id="asm-username" value="${escapeHtml(student.username)}" />
+          </div>
+          <div>
+            <label>Yangi parol (o'zgartirmoqchi bo'lmasangiz bo'sh qoldiring)</label>
+            <input type="text" id="asm-password" />
+          </div>
+          <div id="asm-msg"></div>
+          <div class="row" style="justify-content:flex-end;margin-top:8px;">
+            <button class="ghost" id="asm-cancel">Bekor qilish</button>
+            <button id="asm-save">Saqlash</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  `);
+  function close(){ overlay.remove(); }
+  overlay.addEventListener("click", (e)=>{ if(e.target === overlay) close(); });
+  overlay.querySelector("#asm-cancel").addEventListener("click", close);
+  overlay.querySelector("#asm-avatar-btn").addEventListener("click", ()=>{
+    overlay.querySelector("#asm-avatar-input").click();
+  });
+  overlay.querySelector("#asm-avatar-input").addEventListener("change", async (e)=>{
+    const file = e.target.files && e.target.files[0];
+    if(!file) return;
+    const btn = overlay.querySelector("#asm-avatar-btn");
+    btn.disabled = true; btn.textContent = "Yuklanmoqda...";
+    try{
+      const dataUrl = await resizeImageFile(file, 512);
+      await rpc("app_admin_set_avatar", { p_admin_id: state.session.id, p_student_id: student.id, p_avatar: dataUrl });
+      currentAvatar = dataUrl;
+      overlay.querySelector("#asm-avatar-preview").innerHTML = `<img src="${dataUrl}" style="width:100%;height:100%;object-fit:cover;" />`;
+      btn.disabled = false; btn.textContent = "Rasm tanlash";
+    }catch(err){
+      btn.disabled = false; btn.textContent = "Rasm tanlash";
+      showAlertModal("Rasmni yuklashda xatolik: " + (err.message || String(err)));
+    }
+  });
+  overlay.querySelector("#asm-save").addEventListener("click", async ()=>{
+    const newUsername = overlay.querySelector("#asm-username").value.trim();
+    const newPassword = overlay.querySelector("#asm-password").value;
+    const msg = overlay.querySelector("#asm-msg");
+    msg.innerHTML = "";
+    if(!newUsername){
+      msg.innerHTML = `<div class="err">Login bo'sh bo'lishi mumkin emas</div>`;
+      return;
+    }
+    const btn = overlay.querySelector("#asm-save");
+    btn.disabled = true;
+    try{
+      await rpc("app_admin_update_student", {
+        p_admin_id: state.session.id,
+        p_student_id: student.id,
+        p_new_username: newUsername !== student.username ? newUsername : null,
+        p_new_password: newPassword || null,
+      });
+      close();
+      fillManageStudents(refreshBox);
+    }catch(e){
+      const text = (e.message||"").includes("duplicate") ? "Bu login band, boshqasini tanlang" : (e.message || String(e));
+      msg.innerHTML = `<div class="err">${escapeHtml(text)}</div>`;
+      btn.disabled = false;
+    }
+  });
+  document.body.appendChild(overlay);
 }
 
 /* ---- Parollar ---- */
