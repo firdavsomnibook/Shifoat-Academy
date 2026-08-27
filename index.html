@@ -134,6 +134,17 @@ function tsToIso(ts){
   return String(ts);
 }
 
+// Test hozir qulflanganmi? Agar "belgilangan ochilish vaqti" o'tib ketgan bo'lsa,
+// qo'lda "Qulfdan chiqarish" bosilmagan bo'lsa ham, avtomatik ochiq hisoblanadi.
+function isTestLocked(v){
+  if(v.locked !== true) return false;
+  if(v.openAt){
+    const openTime = new Date(v.openAt).getTime();
+    if(Number.isFinite(openTime) && Date.now() >= openTime) return false;
+  }
+  return true;
+}
+
 async function requireAdmin(uid){
   const doc = await db.collection("users").doc(uid).get();
   if(!doc.exists || doc.data().role !== "admin") throw new Error("ruxsat yo'q");
@@ -272,6 +283,15 @@ const api = {
     if(!subs.empty) await batch.commit();
   },
 
+  async app_toggle_test_lock({p_admin_id, p_test_id, p_locked, p_open_at}){
+    await requireAdminLike(p_admin_id);
+    await db.collection("tests").doc(p_test_id).update({
+      locked: !!p_locked,
+      openAt: p_locked ? (p_open_at || null) : null,
+    });
+    return [{}];
+  },
+
   async app_list_tests({p_user_id}){
     const userDoc = await db.collection("users").doc(p_user_id).get();
     if(!userDoc.exists) throw new Error("ruxsat yo'q");
@@ -293,6 +313,8 @@ const api = {
         time_limit_minutes: v.timeLimitMinutes || null,
         submitted: !!sub,
         can_resubmit: canResubmit,
+        locked: isTestLocked(v),
+        open_at: v.openAt || null,
       };
     });
     rows.sort((a,b)=> (b.created_at||"").localeCompare(a.created_at||""));
@@ -303,6 +325,7 @@ const api = {
     const doc = await db.collection("tests").doc(p_test_id).get();
     if(!doc.exists) throw new Error("anketa topilmadi");
     const v = doc.data();
+    if(isTestLocked(v)) throw new Error("Bu anketa hozircha qulflangan. Administratorga murojaat qiling.");
     return (v.questions||[]).map((q,i)=>({
       question_id: String(i), position: i, text: q.text, type: q.type, options: q.options || null,
     }));
@@ -321,6 +344,7 @@ const api = {
   async app_submit_test({p_student_id, p_test_id, p_answers, p_meta, p_started_at}){
     const testDoc = await db.collection("tests").doc(p_test_id).get();
     if(!testDoc.exists) throw new Error("anketa topilmadi");
+    if(isTestLocked(testDoc.data())) throw new Error("Bu anketa qulflangan, topshirib bo'lmaydi.");
     const studentDoc = await db.collection("users").doc(p_student_id).get();
     const sv = studentDoc.exists ? studentDoc.data() : {};
     const subRef = db.collection("submissions").doc(p_test_id + "_" + p_student_id);
@@ -400,6 +424,11 @@ const state = {
 };
 
 let takeTestTimerId = null;
+let takeTestVisibilityHandler = null;
+function cleanupTakeTest(){
+  if(takeTestTimerId){ clearInterval(takeTestTimerId); takeTestTimerId = null; }
+  if(takeTestVisibilityHandler){ document.removeEventListener("visibilitychange", takeTestVisibilityHandler); takeTestVisibilityHandler = null; }
+}
 
 function setSession(s){
   state.session = s;
@@ -586,7 +615,7 @@ function renderShell(){
     render();
   });
   header.querySelector("#logout-btn").addEventListener("click", ()=>{
-    if(takeTestTimerId){ clearInterval(takeTestTimerId); takeTestTimerId = null; }
+    cleanupTakeTest();
     setSession(null);
     render();
   });
@@ -844,6 +873,7 @@ function renderAdminHome(){
     ["passwords", "Parollar"],
     ["create-test", "Anketa yaratish"],
     ["tests", "Anketalar"],
+    ["lock-tests", "Testlarni qulflash"],
   ];
   const tabBar = el(`<div class="tabs"></div>`);
   tabs.forEach(([key,label])=>{
@@ -861,6 +891,7 @@ function renderAdminHome(){
   else if(state.adminTab === "passwords") fillPasswords(content);
   else if(state.adminTab === "create-test") fillCreateTest(content);
   else if(state.adminTab === "tests") fillAdminTests(content);
+  else if(state.adminTab === "lock-tests") fillLockTests(content);
 
   return wrap;
 }
@@ -908,7 +939,7 @@ function fillCreateStudent(box){
         p_full_name: full_name || null,
         p_is_co_admin: isCoAdmin
       });
-      msg.innerHTML = `<div class="msg-ok">O'quvchi yaratildi ✓</div>`;
+      msg.innerHTML = `<div class="msg-ok">Xodim yaratildi ✓</div>`;
       box.querySelector("#cs-name").value = "";
       box.querySelector("#cs-username").value = "";
       box.querySelector("#cs-password").value = "";
@@ -1338,6 +1369,74 @@ function fillAdminTests(box){
   });
 }
 
+/* ---- Admin: Testlarni qulflash (alohida bo'lim) ---- */
+function fillLockTests(box){
+  box.innerHTML = `<p class="muted">Yuklanmoqda...</p>`;
+  rpc("app_list_tests", { p_user_id: state.session.id }).then(rows=>{
+    if(!rows || rows.length===0){
+      box.innerHTML = `<p class="muted">Hozircha anketalar yo'q.</p>`;
+      return;
+    }
+    box.innerHTML = `
+      <p class="muted" style="margin-top:0;">Qulflangan anketaga o'quvchilar kira olmaydi. Xohlasangiz, belgilangan sana-vaqtda anketa o'zi avtomatik ochilishini ham sozlashingiz mumkin.</p>
+      <table>
+        <thead><tr><th>Anketa nomi</th><th>Holat</th><th>Belgilangan ochilish vaqti</th><th></th></tr></thead>
+        <tbody>
+          ${rows.map(r=>`
+            <tr>
+              <td>${escapeHtml(r.title)}</td>
+              <td>${r.locked ? `<span class="badge" style="background:#fde2e2;color:#d21f1f;">🔒 Qulflangan</span>` : `<span class="badge ok">Ochiq</span>`}</td>
+              <td>${r.open_at ? escapeHtml(new Date(r.open_at).toLocaleString("uz-UZ")) : "—"}</td>
+              <td>
+                <div class="row" style="flex-wrap:wrap;gap:6px;align-items:center;">
+                  ${r.locked
+                    ? `<button class="secondary unlock-test" data-id="${r.id}">Qulfdan chiqarish</button>`
+                    : `<button class="secondary lock-test" data-id="${r.id}">Qulflash</button>`}
+                  <input type="datetime-local" class="open-at-input" data-id="${r.id}" style="width:auto;padding:6px 8px;" />
+                  <button class="secondary schedule-open" data-id="${r.id}">Belgilangan vaqtda ochish</button>
+                </div>
+              </td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    `;
+    box.querySelectorAll(".lock-test").forEach(b=>{
+      b.addEventListener("click", async ()=>{
+        try{
+          await rpc("app_toggle_test_lock", { p_admin_id: state.session.id, p_test_id: b.dataset.id, p_locked: true, p_open_at: null });
+          fillLockTests(box);
+        }catch(e){ showAlertModal(e.message || String(e)); }
+      });
+    });
+    box.querySelectorAll(".unlock-test").forEach(b=>{
+      b.addEventListener("click", async ()=>{
+        try{
+          await rpc("app_toggle_test_lock", { p_admin_id: state.session.id, p_test_id: b.dataset.id, p_locked: false });
+          fillLockTests(box);
+        }catch(e){ showAlertModal(e.message || String(e)); }
+      });
+    });
+    box.querySelectorAll(".schedule-open").forEach(b=>{
+      b.addEventListener("click", async ()=>{
+        const input = box.querySelector(`.open-at-input[data-id="${b.dataset.id}"]`);
+        const val = input ? input.value : "";
+        if(!val){
+          showAlertModal("Iltimos, avval anketa ochiladigan sana va vaqtni tanlang.");
+          return;
+        }
+        const iso = new Date(val).toISOString();
+        try{
+          await rpc("app_toggle_test_lock", { p_admin_id: state.session.id, p_test_id: b.dataset.id, p_locked: true, p_open_at: iso });
+          fillLockTests(box);
+        }catch(e){ showAlertModal(e.message || String(e)); }
+      });
+    });
+  }).catch(e=>{
+    box.innerHTML = `<div class="err">${escapeHtml(e.message||String(e))}</div>`;
+  });
+}
+
 function renderStudentResults(){
   const wrap = el(`<div></div>`);
   const back = el(`<button class="ghost" style="margin-bottom:12px;padding:0;">← Xodimlarga qaytish</button>`);
@@ -1561,10 +1660,12 @@ function renderStudentHome(){
               <td>${escapeHtml(r.title)}</td>
               <td>${r.question_count}</td>
               <td>${r.time_limit_minutes ? r.time_limit_minutes + " daqiqa" : "—"}</td>
-              <td>${r.submitted ? `<span class="badge ok">Topshirilgan</span>` : `<span class="badge pending">Topshirilmagan</span>`}</td>
-              <td>${(!r.submitted || r.can_resubmit)
-                ? `<button class="secondary start-test" data-id="${r.id}" data-title="${escapeHtml(r.title)}" data-timelimit="${r.time_limit_minutes || ""}">${r.submitted ? "Qayta topshirish" : "Boshlash"}</button>`
-                : `<span class="muted" style="font-size:13px;">Yakunlangan</span>`}</td>
+              <td>${r.locked ? `<span class="badge" style="background:#fde2e2;color:#d21f1f;">🔒 Qulflangan</span>` : (r.submitted ? `<span class="badge ok">Topshirilgan</span>` : `<span class="badge pending">Topshirilmagan</span>`)}</td>
+              <td>${r.locked
+                ? `<span class="muted" style="font-size:13px;">Kirish mumkin emas</span>`
+                : (!r.submitted || r.can_resubmit)
+                  ? `<button class="secondary start-test" data-id="${r.id}" data-title="${escapeHtml(r.title)}" data-timelimit="${r.time_limit_minutes || ""}">${r.submitted ? "Qayta topshirish" : "Boshlash"}</button>`
+                  : `<span class="muted" style="font-size:13px;">Yakunlangan</span>`}</td>
             </tr>
           `).join("")}
         </tbody>
@@ -1586,13 +1687,13 @@ function renderStudentHome(){
 }
 
 function renderTakeTest(){
-  if(takeTestTimerId){ clearInterval(takeTestTimerId); takeTestTimerId = null; }
+  cleanupTakeTest();
   const startedAt = Date.now();
 
   const wrap = el(`<div></div>`);
   const back = el(`<button class="ghost" style="margin-bottom:12px;padding:0;">← Orqaga</button>`);
   back.addEventListener("click", ()=>{
-    if(takeTestTimerId){ clearInterval(takeTestTimerId); takeTestTimerId = null; }
+    cleanupTakeTest();
     state.view="home";
     render();
   });
@@ -1663,8 +1764,9 @@ function renderTakeTest(){
     const msg = el(`<div id="tt-msg"></div>`);
     const submitBtn = el(`<button id="tt-submit">Anketani topshirish</button>`);
 
-    async function doSubmit(isAuto){
-      if(!isAuto && (!meta.date || !meta.department.trim() || !meta.position.trim())){
+    async function doSubmit(reason){
+      // reason: "manual" | "timeout" | "tabswitch"
+      if(reason === "manual" && (!meta.date || !meta.department.trim() || !meta.position.trim())){
         msg.innerHTML = `<div class="err">Iltimos, sana, bo'lim va lavozimni to'ldiring</div>`;
         return;
       }
@@ -1678,16 +1780,19 @@ function renderTakeTest(){
           p_meta: meta,
           p_started_at: startedAt
         });
-        if(takeTestTimerId){ clearInterval(takeTestTimerId); takeTestTimerId = null; }
+        cleanupTakeTest();
         state.view = "home";
         render();
-        showAlertModal(isAuto ? "Vaqt tugadi — anketa avtomatik topshirildi. Rahmat." : "Anketa topshirildi! Rahmat.");
+        let alertMsg = "Anketa topshirildi! Rahmat.";
+        if(reason === "timeout") alertMsg = "Vaqt tugadi — anketa avtomatik topshirildi. Rahmat.";
+        if(reason === "tabswitch") alertMsg = "Anketadan chiqib ketganingiz uchun u avtomatik topshirildi.";
+        showAlertModal(alertMsg);
       }catch(e){
         msg.innerHTML = `<div class="err">${escapeHtml(e.message||String(e))}</div>`;
         submitBtn.disabled = false;
       }
     }
-    submitBtn.addEventListener("click", ()=> doSubmit(false));
+    submitBtn.addEventListener("click", ()=> doSubmit("manual"));
 
     card.appendChild(msg);
     card.appendChild(submitBtn);
@@ -1699,7 +1804,7 @@ function renderTakeTest(){
         if(remainMs <= 0){
           timerBox.innerHTML = `<span style="color:#d21f1f;">Vaqt tugadi</span>`;
           if(takeTestTimerId){ clearInterval(takeTestTimerId); takeTestTimerId = null; }
-          doSubmit(true);
+          doSubmit("timeout");
           return;
         }
         const totalSec = Math.ceil(remainMs / 1000);
@@ -1711,6 +1816,16 @@ function renderTakeTest(){
       tick();
       takeTestTimerId = setInterval(tick, 1000);
     }
+
+    // Student boshqa varaq/oynaga o'tsa yoki testdan chiqib ketsa — anketa avtomatik topshiriladi.
+    takeTestVisibilityHandler = () => {
+      if(document.hidden){
+        document.removeEventListener("visibilitychange", takeTestVisibilityHandler);
+        takeTestVisibilityHandler = null;
+        doSubmit("tabswitch");
+      }
+    };
+    document.addEventListener("visibilitychange", takeTestVisibilityHandler);
   }).catch(e=>{
     card.innerHTML = `<div class="err">${escapeHtml(e.message||String(e))}</div>`;
   });
