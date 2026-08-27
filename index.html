@@ -264,11 +264,12 @@ const api = {
     return [{}];
   },
 
-  async app_create_test({p_admin_id, p_title, p_questions, p_time_limit_minutes}){
+  async app_create_test({p_admin_id, p_title, p_questions, p_time_limit_minutes, p_kind}){
     await requireAdminLike(p_admin_id);
     const ref = await db.collection("tests").add({
       title: p_title, questions: p_questions, createdBy: p_admin_id,
       timeLimitMinutes: p_time_limit_minutes || null,
+      kind: p_kind === "test" ? "test" : "anketa",
       createdAt: firebase.firestore.FieldValue.serverTimestamp()
     });
     return ref.id;
@@ -315,6 +316,7 @@ const api = {
         can_resubmit: canResubmit,
         locked: isTestLocked(v),
         open_at: v.openAt || null,
+        kind: v.kind === "test" ? "test" : "anketa",
       };
     });
     rows.sort((a,b)=> (b.created_at||"").localeCompare(a.created_at||""));
@@ -399,7 +401,8 @@ const api = {
         answers: v.answers,
         meta: v.meta || null,
         started_at: v.startedAt || null,
-        submitted_at: tsToIso(v.submittedAt)
+        submitted_at: tsToIso(v.submittedAt),
+        kind: t.kind === "test" ? "test" : "anketa",
       };
     });
     rows.sort((a,b)=> (b.submitted_at||"").localeCompare(a.submitted_at||""));
@@ -872,7 +875,9 @@ function renderAdminHome(){
     ["manage-students", "Xodimlar"],
     ["passwords", "Parollar"],
     ["create-test", "Anketa yaratish"],
+    ["create-test-graded", "Test yaratish"],
     ["tests", "Anketalar"],
+    ["graded-tests", "Testlar"],
     ["lock-tests", "Testlarni qulflash"],
   ];
   const tabBar = el(`<div class="tabs"></div>`);
@@ -889,8 +894,10 @@ function renderAdminHome(){
   if(state.adminTab === "create-student") fillCreateStudent(content);
   else if(state.adminTab === "manage-students") fillManageStudents(content);
   else if(state.adminTab === "passwords") fillPasswords(content);
-  else if(state.adminTab === "create-test") fillCreateTest(content);
+  else if(state.adminTab === "create-test") fillCreateTest(content, testBuilder, "anketa");
+  else if(state.adminTab === "create-test-graded") fillCreateTest(content, gradedTestBuilder, "test");
   else if(state.adminTab === "tests") fillAdminTests(content);
+  else if(state.adminTab === "graded-tests") fillGradedTests(content);
   else if(state.adminTab === "lock-tests") fillLockTests(content);
 
   return wrap;
@@ -1050,10 +1057,15 @@ function fillPasswords(box){
 const testBuilder = {
   title: "",
   timeLimitMinutes: "",
-  questions: [], // {text, options:[..]}
+  questions: [], // {text, options:[..], correctIndex}
+};
+const gradedTestBuilder = {
+  title: "",
+  timeLimitMinutes: "",
+  questions: [], // {text, options:[..], correctIndex}
 };
 function newQuestion(){
-  return { text: "", options: ["",""] };
+  return { text: "", options: ["",""], correctIndex: null };
 }
 
 /* Ko'plab savollarni bir yo'la matndan o'qib olish.
@@ -1079,6 +1091,21 @@ function stripLeadingQuestionNumber(line){
   return String(line || "").replace(/^\s*\d{1,2}[\.\)]\s+/, "").trim();
 }
 
+/* "Javob: A — Natrii chloridum" yoki "Javob: 2" kabi to'g'ri javob kalitini
+   o'qiydi. Harf bo'lsa A=0, B=1, ... ga aylantiradi; raqam bo'lsa (1-based)
+   0-based indeksga aylantiradi. Mos kelmasa null qaytaradi. */
+function parseAnswerKeyLine(line){
+  const m = String(line || "").trim().match(/^(?:to'g'ri\s+)?javob\s*[:\-]?\s*([A-Za-z]|\d{1,2})\b/i);
+  if(!m) return null;
+  const token = m[1];
+  if(/^[A-Za-z]$/.test(token)){
+    return { index: token.toUpperCase().charCodeAt(0) - 65 };
+  }
+  const n = parseInt(token, 10);
+  if(Number.isFinite(n) && n >= 1) return { index: n - 1 };
+  return null;
+}
+
 /* Ko'plab savollarni bitta matndan o'qib oladi. Ikki holatni qo'llab-quvvatlaydi:
    1) Savollar orasida BO'SH QATOR bo'lsa — har bir blok alohida savol hisoblanadi,
       blok ichidagi qatorlar variant (bitta qatorga bittadan yoki zich "1) ... 2) ..." holida).
@@ -1102,15 +1129,28 @@ function parseBulkQuestions(raw){
     }
     if(current.length) blocks.push(current);
 
-    return blocks
-      .map(blockLines => {
-        const [firstLine, ...rest] = blockLines;
-        const text = stripLeadingQuestionNumber(firstLine);
-        const options = [];
-        for(const line of rest) options.push(...splitInlineOptions(line));
-        return { text, options };
-      })
-      .filter(q => q.text.length > 0);
+    const questions = [];
+    for(const blockLines of blocks){
+      const [firstLine, ...rest] = blockLines;
+      const soloAnswer = rest.length === 0 ? parseAnswerKeyLine(firstLine) : null;
+      if(soloAnswer && questions.length){
+        // Butun blok faqat "Javob: ..." qatoridan iborat — bu oldingi savolning to'g'ri javobi
+        const prev = questions[questions.length - 1];
+        if(soloAnswer.index >= 0 && soloAnswer.index < prev.options.length) prev.correctIndex = soloAnswer.index;
+        continue;
+      }
+      const text = stripLeadingQuestionNumber(firstLine);
+      const options = [];
+      let correctIndex = null;
+      for(const line of rest){
+        const ans = parseAnswerKeyLine(line);
+        if(ans){ correctIndex = ans.index; continue; }
+        options.push(...splitInlineOptions(line));
+      }
+      if(correctIndex != null && (correctIndex < 0 || correctIndex >= options.length)) correctIndex = null;
+      if(text.length > 0) questions.push({ text, options, correctIndex });
+    }
+    return questions;
   }
 
   const lines = rawLines.map(l => l.trim()).filter(Boolean);
@@ -1123,6 +1163,13 @@ function parseBulkQuestions(raw){
       i++;
       continue;
     }
+    const ansOnly = parseAnswerKeyLine(line);
+    if(ansOnly && questions.length){
+      const prev = questions[questions.length - 1];
+      if(ansOnly.index >= 0 && ansOnly.index < prev.options.length) prev.correctIndex = ansOnly.index;
+      i++;
+      continue;
+    }
     const text = stripLeadingQuestionNumber(line);
     let options = [];
     if(i + 1 < lines.length && countInlineMarkers(lines[i + 1]) >= 2){
@@ -1131,18 +1178,36 @@ function parseBulkQuestions(raw){
     }else{
       i += 1;
     }
-    if(text) questions.push({ text, options });
+    let correctIndex = null;
+    if(i < lines.length){
+      const ans = parseAnswerKeyLine(lines[i]);
+      if(ans){
+        if(ans.index >= 0 && ans.index < options.length) correctIndex = ans.index;
+        i++;
+      }
+    }
+    if(text) questions.push({ text, options, correctIndex });
   }
   return questions;
 }
 
-function showBulkUploadModal(box){
+function showBulkUploadModal(box, builder, mode){
   const overlay = el(`
     <div class="overlay">
       <div class="modal" style="max-width:640px;">
         <h2>Savollarni yuklash</h2>
-        <p style="margin:0 0 12px;color:var(--ink-soft);">Har bir savolni alohida qatorga yozing. Variantlarni xohlasangiz har birini alohida qatorga, xohlasangiz bittasiga zich qilib ("1) Yomon 2) Yaxshi 3) A'lo" kabi) yozishingiz mumkin. Savolga variant yozilmasa, u o'zi ochiq (yozma) savol bo'lib yuklanadi. Ikkita namuna:</p>
-        <pre style="background:var(--bg);border-radius:8px;padding:10px 12px;font-size:12.5px;color:var(--ink-soft);white-space:pre-wrap;margin:0 0 14px;">Necha yoshdasiz?
+        <p style="margin:0 0 12px;color:var(--ink-soft);">Har bir savolni alohida qatorga yozing. Variantlarni xohlasangiz har birini alohida qatorga, xohlasangiz bittasiga zich qilib ("1) Yomon 2) Yaxshi 3) A'lo" kabi) yozishingiz mumkin. Savolga variant yozilmasa, u o'zi ochiq (yozma) savol bo'lib yuklanadi.${mode === "test" ? ` To'g'ri javobni ko'rsatish uchun variantlardan keyin "Javob: A" (yoki variant harfi/raqami) deb yozing — bu alohida savol bo'lib qolmaydi, o'sha variant to'g'ri javob qilib belgilanadi.` : ``} Namuna:</p>
+        <pre style="background:var(--bg);border-radius:8px;padding:10px 12px;font-size:12.5px;color:var(--ink-soft);white-space:pre-wrap;margin:0 0 14px;">${mode === "test" ? `2+2 nechiga teng?
+A) 3
+B) 4
+C) 5
+Javob: B
+
+Poytaxtimiz qaysi shahar?
+A) Samarqand
+B) Buxoro
+C) Toshkent
+Javob: C` : `Necha yoshdasiz?
 18-25
 26-35
 36-45
@@ -1150,7 +1215,7 @@ function showBulkUploadModal(box){
 Korxona manziliga kelish qulayligi?
 1) Yomon 2) Yaxshi 3) A'lo
 
-Fikr va takliflaringiz</pre>
+Fikr va takliflaringiz`}</pre>
         <textarea id="bulk-text" rows="10" style="width:100%;box-sizing:border-box;resize:vertical;" placeholder="Savollarni shu yerga joylashtiring..."></textarea>
         <div id="bulk-msg" style="margin-top:10px;"></div>
         <div class="row" style="justify-content:flex-end;margin-top:14px;">
@@ -1171,44 +1236,49 @@ Fikr va takliflaringiz</pre>
       msg.innerHTML = `<div class="err">Savol topilmadi. Formatni tekshirib qaytadan urinib ko'ring.</div>`;
       return;
     }
-    testBuilder.questions = parsed.map(q => ({ text: q.text, options: q.options }));
+    builder.questions = parsed.map(q => ({ text: q.text, options: q.options, correctIndex: (mode === "test" && q.correctIndex != null) ? q.correctIndex : null }));
     close();
-    drawTestBuilder(box);
+    drawTestBuilder(box, builder, mode);
     box.querySelector("#tb-msg").innerHTML = `<div class="msg-ok">${parsed.length} ta savol muvaffaqiyatli yuklandi ✓</div>`;
   });
   document.body.appendChild(overlay);
 }
-function fillCreateTest(box){
-  if(testBuilder.questions.length === 0){
-    testBuilder.questions.push(newQuestion());
+function fillCreateTest(box, builder, mode){
+  if(builder.questions.length === 0){
+    builder.questions.push(newQuestion());
   }
-  drawTestBuilder(box);
+  drawTestBuilder(box, builder, mode);
 }
-function drawTestBuilder(box){
+function drawTestBuilder(box, builder, mode){
+  const isGraded = mode === "test";
   box.innerHTML = "";
 
   const titleRow = el(`
     <div class="row" style="align-items:flex-end;gap:16px;margin-bottom:16px;flex-wrap:wrap;">
       <div style="max-width:480px;flex:1;min-width:220px;">
-        <label>Anketa nomi</label>
-        <input type="text" id="tb-title" value="${escapeHtml(testBuilder.title)}" placeholder="Masalan: Xodimlar so'rovnomasi" />
+        <label>${isGraded ? "Test nomi" : "Anketa nomi"}</label>
+        <input type="text" id="tb-title" value="${escapeHtml(builder.title)}" placeholder="Masalan: Xodimlar so'rovnomasi" />
       </div>
       <div style="max-width:200px;min-width:160px;">
         <label>Vaqt chegarasi, daqiqa (ixtiyoriy)</label>
-        <input type="number" min="1" step="1" id="tb-timelimit" value="${escapeHtml(String(testBuilder.timeLimitMinutes || ""))}" placeholder="Masalan: 15" />
+        <input type="number" min="1" step="1" id="tb-timelimit" value="${escapeHtml(String(builder.timeLimitMinutes || ""))}" placeholder="Masalan: 15" />
       </div>
       <button class="secondary" id="tb-bulk-upload" type="button">Savollarni yuklash</button>
     </div>
   `);
-  titleRow.querySelector("#tb-title").addEventListener("input", e=>{ testBuilder.title = e.target.value; });
-  titleRow.querySelector("#tb-timelimit").addEventListener("input", e=>{ testBuilder.timeLimitMinutes = e.target.value; });
-  titleRow.querySelector("#tb-bulk-upload").addEventListener("click", ()=>{ showBulkUploadModal(box); });
+  titleRow.querySelector("#tb-title").addEventListener("input", e=>{ builder.title = e.target.value; });
+  titleRow.querySelector("#tb-timelimit").addEventListener("input", e=>{ builder.timeLimitMinutes = e.target.value; });
+  titleRow.querySelector("#tb-bulk-upload").addEventListener("click", ()=>{ showBulkUploadModal(box, builder, mode); });
   box.appendChild(titleRow);
+
+  if(isGraded){
+    box.appendChild(el(`<p class="muted" style="margin-top:-10px;">Har bir savol uchun to'g'ri javobni variant yonidagi doirachani belgilab ko'rsating.</p>`));
+  }
 
   const qList = el(`<div id="tb-questions"></div>`);
   box.appendChild(qList);
 
-  testBuilder.questions.forEach((q, qi)=>{
+  builder.questions.forEach((q, qi)=>{
     const isOpen = q.options.length === 0;
     const qCard = el(`
       <div class="q-card">
@@ -1232,7 +1302,8 @@ function drawTestBuilder(box){
     const optList = qCard.querySelector(".opt-list");
     q.options.forEach((optVal, oi)=>{
       const row = el(`
-        <div class="opt-row">
+        <div class="opt-row" style="align-items:center;">
+          ${isGraded ? `<input type="radio" name="correct-${qi}" class="correct-opt" data-qi="${qi}" data-oi="${oi}" ${q.correctIndex === oi ? "checked" : ""} title="To'g'ri javob shu" style="width:18px;height:18px;flex:none;" />` : ``}
           <input type="text" value="${escapeHtml(optVal)}" placeholder="${oi+1}-variant" />
           <button class="danger remove-opt" data-qi="${qi}" data-oi="${oi}">✕</button>
         </div>
@@ -1240,19 +1311,27 @@ function drawTestBuilder(box){
       row.querySelector('input[type=text]').addEventListener("input", (e)=>{ q.options[oi] = e.target.value; });
       row.querySelector('.remove-opt').addEventListener("click", ()=>{
         q.options.splice(oi,1);
-        drawTestBuilder(box);
+        if(q.correctIndex === oi) q.correctIndex = null;
+        else if(q.correctIndex != null && q.correctIndex > oi) q.correctIndex--;
+        drawTestBuilder(box, builder, mode);
       });
+      if(isGraded){
+        row.querySelector('.correct-opt').addEventListener("change", ()=>{
+          q.correctIndex = oi;
+          drawTestBuilder(box, builder, mode);
+        });
+      }
       optList.appendChild(row);
     });
 
     qCard.querySelector(".q-text").addEventListener("input", e=>{ q.text = e.target.value; });
     qCard.querySelector(".add-opt").addEventListener("click", ()=>{
       q.options.push("");
-      drawTestBuilder(box);
+      drawTestBuilder(box, builder, mode);
     });
     qCard.querySelector(".remove-q").addEventListener("click", ()=>{
-      testBuilder.questions.splice(qi,1);
-      drawTestBuilder(box);
+      builder.questions.splice(qi,1);
+      drawTestBuilder(box, builder, mode);
     });
 
     qList.appendChild(qCard);
@@ -1261,12 +1340,12 @@ function drawTestBuilder(box){
   const actions = el(`
     <div class="row" style="margin:14px 0 4px;">
       <button class="secondary" id="tb-add-q">+ Savol qo'shish</button>
-      <button id="tb-save">Anketani saqlash</button>
+      <button id="tb-save">${isGraded ? "Testni saqlash" : "Anketani saqlash"}</button>
     </div>
   `);
   actions.querySelector("#tb-add-q").addEventListener("click", ()=>{
-    testBuilder.questions.push(newQuestion());
-    drawTestBuilder(box);
+    builder.questions.push(newQuestion());
+    drawTestBuilder(box, builder, mode);
   });
   box.appendChild(actions);
 
@@ -1274,15 +1353,15 @@ function drawTestBuilder(box){
   box.appendChild(msg);
 
   actions.querySelector("#tb-save").addEventListener("click", async ()=>{
-    if(!testBuilder.title.trim()){
-      msg.innerHTML = `<div class="err">Anketa nomini kiriting</div>`;
+    if(!builder.title.trim()){
+      msg.innerHTML = `<div class="err">${isGraded ? "Test nomini kiriting" : "Anketa nomini kiriting"}</div>`;
       return;
     }
-    if(testBuilder.questions.length === 0){
+    if(builder.questions.length === 0){
       msg.innerHTML = `<div class="err">Kamida bitta savol qo'shing</div>`;
       return;
     }
-    for(const q of testBuilder.questions){
+    for(const q of builder.questions){
       if(!q.text.trim()){
         msg.innerHTML = `<div class="err">Barcha savollar matnini to'ldiring</div>`;
         return;
@@ -1291,9 +1370,13 @@ function drawTestBuilder(box){
         msg.innerHTML = `<div class="err">Variant maydonlarini to'ldiring yoki keraksizini o'chiring</div>`;
         return;
       }
+      if(isGraded && q.options.length > 0 && (q.correctIndex == null || q.correctIndex < 0 || q.correctIndex >= q.options.length)){
+        msg.innerHTML = `<div class="err">Har bir savol uchun to'g'ri javobni belgilang</div>`;
+        return;
+      }
     }
     let timeLimitMinutes = null;
-    const rawTimeLimit = String(testBuilder.timeLimitMinutes || "").trim();
+    const rawTimeLimit = String(builder.timeLimitMinutes || "").trim();
     if(rawTimeLimit){
       const n = Number(rawTimeLimit);
       if(!Number.isFinite(n) || n <= 0){
@@ -1302,26 +1385,28 @@ function drawTestBuilder(box){
       }
       timeLimitMinutes = Math.round(n);
     }
-    const payload = testBuilder.questions.map(q=>{
+    const payload = builder.questions.map(q=>{
       const isOpen = q.options.length === 0;
       return {
         text: q.text.trim(),
         type: isOpen ? "open" : "mcq",
         options: isOpen ? null : q.options.map(o=>o.trim()),
+        correct_index: (isGraded && !isOpen) ? q.correctIndex : null,
       };
     });
     try{
       await rpc("app_create_test", {
         p_admin_id: state.session.id,
-        p_title: testBuilder.title.trim(),
+        p_title: builder.title.trim(),
         p_questions: payload,
-        p_time_limit_minutes: timeLimitMinutes
+        p_time_limit_minutes: timeLimitMinutes,
+        p_kind: isGraded ? "test" : "anketa"
       });
-      testBuilder.title = "";
-      testBuilder.timeLimitMinutes = "";
-      testBuilder.questions = [newQuestion()];
-      drawTestBuilder(box);
-      box.querySelector("#tb-msg").innerHTML = `<div class="msg-ok">Anketa saqlandi ✓</div>`;
+      builder.title = "";
+      builder.timeLimitMinutes = "";
+      builder.questions = [newQuestion()];
+      drawTestBuilder(box, builder, mode);
+      box.querySelector("#tb-msg").innerHTML = `<div class="msg-ok">${isGraded ? "Test saqlandi ✓" : "Anketa saqlandi ✓"}</div>`;
     }catch(e){
       msg.innerHTML = `<div class="err">${escapeHtml(e.message||String(e))}</div>`;
     }
@@ -1329,16 +1414,17 @@ function drawTestBuilder(box){
 }
 
 /* ---- Admin: Testlar ro'yxati ---- */
-function fillAdminTests(box){
+function fillTestsListByKind(box, kind, refillFn, nameCol, emptyMsg, deleteConfirmMsg){
   box.innerHTML = `<p class="muted">Yuklanmoqda...</p>`;
-  rpc("app_list_tests", { p_user_id: state.session.id }).then(rows=>{
-    if(!rows || rows.length===0){
-      box.innerHTML = `<p class="muted">Hozircha anketalar yo'q.</p>`;
+  rpc("app_list_tests", { p_user_id: state.session.id }).then(allRows=>{
+    const rows = (allRows || []).filter(r => r.kind === kind);
+    if(rows.length===0){
+      box.innerHTML = `<p class="muted">${emptyMsg}</p>`;
       return;
     }
     box.innerHTML = `
       <table>
-        <thead><tr><th>Anketa nomi</th><th>Savollar soni</th><th>Vaqt chegarasi</th><th>Yaratilgan</th><th></th></tr></thead>
+        <thead><tr><th>${nameCol}</th><th>Savollar soni</th><th>Vaqt chegarasi</th><th>Yaratilgan</th><th></th></tr></thead>
         <tbody>
           ${rows.map(r=>`
             <tr>
@@ -1356,10 +1442,10 @@ function fillAdminTests(box){
     `;
     box.querySelectorAll(".del-test").forEach(b=>{
       b.addEventListener("click", ()=>{
-        showConfirmModal("Bu anketani o'chirmoqchimisiz? Barcha natijalar ham o'chadi.", async ()=>{
+        showConfirmModal(deleteConfirmMsg, async ()=>{
           try{
             await rpc("app_delete_test", { p_admin_id: state.session.id, p_test_id: b.dataset.id });
-            fillAdminTests(box);
+            refillFn(box);
           }catch(e){ showAlertModal(e.message || String(e)); }
         });
       });
@@ -1367,6 +1453,14 @@ function fillAdminTests(box){
   }).catch(e=>{
     box.innerHTML = `<div class="err">${escapeHtml(e.message||String(e))}</div>`;
   });
+}
+
+function fillAdminTests(box){
+  fillTestsListByKind(box, "anketa", fillAdminTests, "Anketa nomi", "Hozircha anketalar yo'q.", "Bu anketani o'chirmoqchimisiz? Barcha natijalar ham o'chadi.");
+}
+
+function fillGradedTests(box){
+  fillTestsListByKind(box, "test", fillGradedTests, "Test nomi", "Hozircha testlar yo'q.", "Bu testni o'chirmoqchimisiz? Barcha natijalar ham o'chadi.");
 }
 
 /* ---- Admin: Testlarni qulflash (alohida bo'lim) ---- */
@@ -1504,8 +1598,12 @@ function renderStudentResults(){
       const started = new Date(r.started_at).getTime();
       const submitted = new Date(r.submitted_at).getTime();
       if(!Number.isFinite(started) || !Number.isFinite(submitted) || submitted < started) return null;
-      const minutes = Math.round((submitted - started) / 60000);
-      return minutes < 1 ? "1 daqiqadan kam" : `${minutes} daqiqa`;
+      const totalSeconds = Math.round((submitted - started) / 1000);
+      const minutes = Math.floor(totalSeconds / 60);
+      const seconds = totalSeconds % 60;
+      if(minutes === 0) return `${seconds} soniya`;
+      if(seconds === 0) return `${minutes} daqiqa`;
+      return `${minutes} daqiqa ${seconds} soniya`;
     }
 
     function answerSummary(answers, qMap){
@@ -1564,8 +1662,6 @@ function renderStudentResults(){
         <p style="font-family:Arial, sans-serif;"><b>Topshirilgan sana:</b> ${escapeHtml(new Date(r.submitted_at).toLocaleString("uz-UZ"))}</p>
         ${r.meta ? `
           <p style="font-family:Arial, sans-serif;"><b>Sana:</b> ${escapeHtml(r.meta.date || "—")}</p>
-          <p style="font-family:Arial, sans-serif;"><b>Bo'limi:</b> ${escapeHtml(r.meta.department || "—")}</p>
-          <p style="font-family:Arial, sans-serif;"><b>Lavozimi:</b> ${escapeHtml(r.meta.position || "—")}</p>
         ` : ``}
         ${formatDuration(r) ? `<p style="font-family:Arial, sans-serif;"><b>Topshirish vaqti:</b> ${escapeHtml(formatDuration(r))}</p>` : ``}
         ${answerSummary(r.answers, qMap) ? `<p style="font-family:Arial, sans-serif;"><b>Belgilagan javoblar soni:</b> ${answerSummary(r.answers, qMap)}</p>` : ``}
@@ -1575,22 +1671,37 @@ function renderStudentResults(){
       downloadWordDoc(`${studentName.replace(/[^a-zA-Z0-9Ѐ-ӿĀ-ſ ]/g,"")}-${r.test_title.replace(/[^a-zA-Z0-9Ѐ-ӿĀ-ſ ]/g,"")}-natija.doc`, bodyHtml);
     }
 
+    function resultsTableHtml(list, nameCol, emptyMsg){
+      if(list.length === 0) return `<p class="muted">${emptyMsg}</p>`;
+      return `
+        <table>
+          <thead><tr><th>${nameCol}</th><th>Topshirilgan</th><th></th></tr></thead>
+          <tbody>
+            ${list.map(r=>{
+              const ri = rows.indexOf(r);
+              return `
+                <tr>
+                  <td>${escapeHtml(r.test_title)}</td>
+                  <td>${new Date(r.submitted_at).toLocaleString("uz-UZ")}</td>
+                  <td><button class="secondary view-result" data-ri="${ri}">Natijasini ko'rish</button></td>
+                </tr>
+              `;
+            }).join("")}
+          </tbody>
+        </table>
+      `;
+    }
+
     function showList(){
+      const anketaRows = rows.filter(r=>r.kind !== "test");
+      const testRows = rows.filter(r=>r.kind === "test");
       card.innerHTML = `
         <h3 style="margin-top:0;">${escapeHtml(state.activeStudentName)} — natijalar</h3>
         <p class="muted" style="margin-top:-6px;">Natijasini ko'rish uchun anketani tanlang</p>
-        <table>
-          <thead><tr><th>Anketa</th><th>Topshirilgan</th><th></th></tr></thead>
-          <tbody>
-            ${rows.map((r,ri)=>`
-              <tr>
-                <td>${escapeHtml(r.test_title)}</td>
-                <td>${new Date(r.submitted_at).toLocaleString("uz-UZ")}</td>
-                <td><button class="secondary view-result" data-ri="${ri}">Natijasini ko'rish</button></td>
-              </tr>
-            `).join("")}
-          </tbody>
-        </table>
+        <h4 style="margin-bottom:8px;">Anketalar</h4>
+        ${resultsTableHtml(anketaRows, "Anketa", "Hozircha anketa natijalari yo'q.")}
+        <h4 style="margin-bottom:8px;margin-top:20px;">Testlar</h4>
+        ${resultsTableHtml(testRows, "Test", "Hozircha test natijalari yo'q.")}
       `;
       card.querySelectorAll(".view-result").forEach(btn=>{
         btn.addEventListener("click", ()=> showDetail(Number(btn.dataset.ri)));
@@ -1610,12 +1721,15 @@ function renderStudentResults(){
               <button class="secondary download-word" data-ri="${ri}">Yuklab olish (Word)</button>
             </div>
           </div>
-          <div class="muted" style="margin:6px 0;">Topshirilgan: ${new Date(r.submitted_at).toLocaleString("uz-UZ")}${formatDuration(r) ? ` (${formatDuration(r)}da topshirdi)` : ``}</div>
+          <div class="muted" style="margin:6px 0;">Topshirilgan: ${new Date(r.submitted_at).toLocaleString("uz-UZ")}</div>
+          ${formatDuration(r) ? `
+            <div style="margin:6px 0;font-size:14px;font-weight:600;color:var(--brand);">
+              ${escapeHtml(state.activeStudentName)} ${r.kind === "test" ? "testni" : "anketani"} ${formatDuration(r)}da ishladi
+            </div>
+          ` : ``}
           ${r.meta ? `
             <div class="muted" style="margin:6px 0;font-size:13px;">
-              Sana: ${escapeHtml(r.meta.date || "—")} &nbsp;·&nbsp;
-              Bo'limi: ${escapeHtml(r.meta.department || "—")} &nbsp;·&nbsp;
-              Lavozimi: ${escapeHtml(r.meta.position || "—")}
+              Sana: ${escapeHtml(r.meta.date || "—")}
             </div>
           ` : ``}
           ${answerSummary(r.answers, qMaps[ri]) ? `
@@ -1643,45 +1757,72 @@ function renderStudentResults(){
 /* =========================================================
    O'QUVCHI — BOSH SAHIFA
    ========================================================= */
-function renderStudentHome(){
-  const wrap = el(`<div><h2 style="margin-top:0;">Anketalar</h2><div class="card" id="st-list"><p class="muted">Yuklanmoqda...</p></div></div>`);
-  const box = wrap.querySelector("#st-list");
-  rpc("app_list_tests", { p_user_id: state.session.id }).then(rows=>{
-    if(!rows || rows.length===0){
-      box.innerHTML = `<p class="muted">Hozircha anketalar mavjud emas.</p>`;
-      return;
-    }
-    box.innerHTML = `
-      <table>
-        <thead><tr><th>Anketa</th><th>Savollar</th><th>Vaqt chegarasi</th><th>Holat</th><th></th></tr></thead>
-        <tbody>
-          ${rows.map(r=>`
-            <tr>
-              <td>${escapeHtml(r.title)}</td>
-              <td>${r.question_count}</td>
-              <td>${r.time_limit_minutes ? r.time_limit_minutes + " daqiqa" : "—"}</td>
-              <td>${r.locked ? `<span class="badge" style="background:#fde2e2;color:#d21f1f;">🔒 Qulflangan</span>` : (r.submitted ? `<span class="badge ok">Topshirilgan</span>` : `<span class="badge pending">Topshirilmagan</span>`)}</td>
-              <td>${r.locked
-                ? `<span class="muted" style="font-size:13px;">Kirish mumkin emas</span>`
-                : (!r.submitted || r.can_resubmit)
-                  ? `<button class="secondary start-test" data-id="${r.id}" data-title="${escapeHtml(r.title)}" data-timelimit="${r.time_limit_minutes || ""}">${r.submitted ? "Qayta topshirish" : "Boshlash"}</button>`
-                  : `<span class="muted" style="font-size:13px;">Yakunlangan</span>`}</td>
-            </tr>
-          `).join("")}
-        </tbody>
-      </table>
-    `;
-    box.querySelectorAll(".start-test").forEach(b=>{
-      b.addEventListener("click", ()=>{
-        state.activeTestId = b.dataset.id;
-        state.activeTestTitle = b.dataset.title;
-        state.activeTestTimeLimit = b.dataset.timelimit ? Number(b.dataset.timelimit) : null;
-        state.view = "take-test";
-        render();
-      });
+function renderStudentTestTable(rows, nameCol){
+  if(!rows || rows.length===0) return null;
+  const box = el(`<div></div>`);
+  box.innerHTML = `
+    <table>
+      <thead><tr><th>${nameCol}</th><th>Savollar</th><th>Vaqt chegarasi</th><th>Holat</th><th></th></tr></thead>
+      <tbody>
+        ${rows.map(r=>`
+          <tr>
+            <td>${escapeHtml(r.title)}</td>
+            <td>${r.question_count}</td>
+            <td>${r.time_limit_minutes ? r.time_limit_minutes + " daqiqa" : "—"}</td>
+            <td>${r.locked ? `<span class="badge" style="background:#fde2e2;color:#d21f1f;">🔒 Qulflangan</span>` : (r.submitted ? `<span class="badge ok">Topshirilgan</span>` : `<span class="badge pending">Topshirilmagan</span>`)}</td>
+            <td>${r.locked
+              ? `<span class="muted" style="font-size:13px;">Kirish mumkin emas</span>`
+              : (!r.submitted || r.can_resubmit)
+                ? `<button class="secondary start-test" data-id="${r.id}" data-title="${escapeHtml(r.title)}" data-timelimit="${r.time_limit_minutes || ""}">${r.submitted ? "Qayta topshirish" : "Boshlash"}</button>`
+                : `<span class="muted" style="font-size:13px;">Yakunlangan</span>`}</td>
+          </tr>
+        `).join("")}
+      </tbody>
+    </table>
+  `;
+  box.querySelectorAll(".start-test").forEach(b=>{
+    b.addEventListener("click", ()=>{
+      state.activeTestId = b.dataset.id;
+      state.activeTestTitle = b.dataset.title;
+      state.activeTestTimeLimit = b.dataset.timelimit ? Number(b.dataset.timelimit) : null;
+      state.view = "take-test";
+      render();
     });
+  });
+  return box;
+}
+
+function renderStudentHome(){
+  const wrap = el(`
+    <div>
+      <h2 style="margin-top:0;">Anketalar</h2>
+      <div class="card" id="st-list-anketa"><p class="muted">Yuklanmoqda...</p></div>
+      <h2>Testlar</h2>
+      <div class="card" id="st-list-test"><p class="muted">Yuklanmoqda...</p></div>
+    </div>
+  `);
+  const anketaBox = wrap.querySelector("#st-list-anketa");
+  const testBox = wrap.querySelector("#st-list-test");
+  rpc("app_list_tests", { p_user_id: state.session.id }).then(rows=>{
+    const anketaRows = (rows||[]).filter(r=>r.kind !== "test");
+    const testRows = (rows||[]).filter(r=>r.kind === "test");
+
+    if(anketaRows.length===0){
+      anketaBox.innerHTML = `<p class="muted">Hozircha anketalar mavjud emas.</p>`;
+    }else{
+      anketaBox.innerHTML = "";
+      anketaBox.appendChild(renderStudentTestTable(anketaRows, "Anketa"));
+    }
+
+    if(testRows.length===0){
+      testBox.innerHTML = `<p class="muted">Hozircha testlar mavjud emas.</p>`;
+    }else{
+      testBox.innerHTML = "";
+      testBox.appendChild(renderStudentTestTable(testRows, "Test"));
+    }
   }).catch(e=>{
-    box.innerHTML = `<div class="err">${escapeHtml(e.message||String(e))}</div>`;
+    anketaBox.innerHTML = `<div class="err">${escapeHtml(e.message||String(e))}</div>`;
+    testBox.innerHTML = "";
   });
   return wrap;
 }
@@ -1703,7 +1844,7 @@ function renderTakeTest(){
   wrap.appendChild(card);
 
   const answers = {}; // question_id -> value
-  const meta = { date: new Date().toISOString().slice(0,10), department: "", position: "" };
+  const meta = { date: new Date().toISOString().slice(0,10) };
 
   rpc("app_get_test", { p_user_id: state.session.id, p_test_id: state.activeTestId }).then(questions=>{
     card.innerHTML = `<h3 style="margin-top:0;">${escapeHtml(state.activeTestTitle)}</h3>`;
@@ -1721,20 +1862,10 @@ function renderTakeTest(){
             <label>Sana</label>
             <input type="date" id="meta-date" value="${escapeHtml(meta.date)}" />
           </div>
-          <div class="col" style="flex:1;min-width:160px;">
-            <label>Bo'limi</label>
-            <input type="text" id="meta-department" placeholder="Masalan: Buxgalteriya" />
-          </div>
-          <div class="col" style="flex:1;min-width:160px;">
-            <label>Lavozimi</label>
-            <input type="text" id="meta-position" placeholder="Masalan: Hamshira" />
-          </div>
         </div>
       </div>
     `);
     metaBox.querySelector("#meta-date").addEventListener("input", e=>{ meta.date = e.target.value; });
-    metaBox.querySelector("#meta-department").addEventListener("input", e=>{ meta.department = e.target.value; });
-    metaBox.querySelector("#meta-position").addEventListener("input", e=>{ meta.position = e.target.value; });
     card.appendChild(metaBox);
 
     const qWrap = el(`<div></div>`);
@@ -1766,8 +1897,8 @@ function renderTakeTest(){
 
     async function doSubmit(reason){
       // reason: "manual" | "timeout" | "tabswitch"
-      if(reason === "manual" && (!meta.date || !meta.department.trim() || !meta.position.trim())){
-        msg.innerHTML = `<div class="err">Iltimos, sana, bo'lim va lavozimni to'ldiring</div>`;
+      if(reason === "manual" && !meta.date){
+        msg.innerHTML = `<div class="err">Iltimos, sanani to'ldiring</div>`;
         return;
       }
       const payload = Object.keys(answers).map(qid=>({ question_id: qid, answer: answers[qid] }));
